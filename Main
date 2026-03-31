@@ -1,0 +1,955 @@
+import csv
+import json
+import os
+import random
+import shutil
+from datetime import datetime
+from typing import Dict, List, Tuple
+
+import matplotlib.pyplot as plt
+import numpy as np
+import seaborn as sns
+
+# Must be configured before PyTorch touches CUDA to keep CuBLAS deterministic.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from matplotlib.colors import LinearSegmentedColormap
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+
+
+IMAGE_SIZE = (30, 30)
+FLATTENED_IMAGE_LENGTH = IMAGE_SIZE[0] * IMAGE_SIZE[1]
+NUM_CLASSES = 2
+TRAIN_SAMPLES_PER_CLASS = 30000
+TEST_SAMPLES_PER_CLASS = 6000
+STRIPE_WIDTH = 2
+GAP_WIDTH = 4
+ACTIVATION_PROBABILITY = 0.85
+NOISE_SIGMA = 0.45
+CONV_KERNEL_SIZE = 3
+BATCH_SIZE = 512
+LEARNING_RATE = 1e-3
+EPOCHS = 50
+RANDOM_SEED = 42
+DETERMINISTIC_WARN_ONLY = True
+
+PLOT_FONTSIZE = 24
+PLOT_DPI = 300
+PLOT_PAD_INCHES = 0.35
+PLOT_FONT_FAMILY = "Arial"
+
+RESULT_ROOT = "1d_stripe_direction"
+DATASET_PREVIEW_FILENAME = "stripe_dataset_class_examples.png"
+COMPARE_CURVE_FILENAME = "stripe_direction_loss_accuracy_compare.png"
+COMPARE_SUMMARY_FILENAME = "stripe_direction_comparison_summary.json"
+PNG_EXPORT_DIRNAME = "png_examples_1d_45deg"
+
+LABEL_NAMES = ["Class 1: Right45", "Class 2: Left45"]
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+PROGRESS_COLORS = {
+    "symmetric": "green",
+    "asymmetric": "blue",
+}
+
+plt.rcParams.update(
+    {
+        "font.family": PLOT_FONT_FAMILY,
+        "font.size": PLOT_FONTSIZE,
+        "axes.titlesize": PLOT_FONTSIZE,
+        "axes.labelsize": PLOT_FONTSIZE,
+        "xtick.labelsize": PLOT_FONTSIZE,
+        "ytick.labelsize": PLOT_FONTSIZE,
+        "legend.fontsize": PLOT_FONTSIZE,
+        "figure.titlesize": PLOT_FONTSIZE,
+        "mathtext.fontset": "stix",
+        "mathtext.rm": PLOT_FONT_FAMILY,
+        "axes.unicode_minus": False,
+    }
+)
+sns.set_theme(
+    style="white",
+    font=PLOT_FONT_FAMILY,
+    rc={
+        "font.family": PLOT_FONT_FAMILY,
+        "font.size": PLOT_FONTSIZE,
+        "axes.titlesize": PLOT_FONTSIZE,
+        "axes.labelsize": PLOT_FONTSIZE,
+        "xtick.labelsize": PLOT_FONTSIZE,
+        "ytick.labelsize": PLOT_FONTSIZE,
+        "legend.fontsize": PLOT_FONTSIZE,
+    },
+)
+
+
+def configure_reproducibility(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        if hasattr(torch.backends.cudnn, "allow_tf32"):
+            torch.backends.cudnn.allow_tf32 = False
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+        torch.backends.cuda.matmul.allow_tf32 = False
+    torch.use_deterministic_algorithms(True, warn_only=DETERMINISTIC_WARN_ONLY)
+
+
+def build_diagonal_mask(
+    label: int,
+    image_size: Tuple[int, int],
+    stripe_width: int,
+    gap_width: int,
+    phase: int,
+) -> np.ndarray:
+    height, width = image_size
+    yy, xx = np.indices((height, width))
+    period = stripe_width + gap_width
+    if label == 0:
+        diagonal_index = (xx - yy - phase) % period
+    elif label == 1:
+        diagonal_index = (xx + yy - phase) % period
+    else:
+        raise ValueError("label must be 0 or 1.")
+    return diagonal_index < stripe_width
+
+
+def generate_stripe_image(
+    label: int,
+    rng: np.random.Generator,
+    image_size: Tuple[int, int] = IMAGE_SIZE,
+    stripe_width: int = STRIPE_WIDTH,
+    gap_width: int = GAP_WIDTH,
+    activation_probability: float = ACTIVATION_PROBABILITY,
+    noise_sigma: float = NOISE_SIGMA,
+) -> np.ndarray:
+    phase = int(rng.integers(0, stripe_width + gap_width))
+    stripe_mask = build_diagonal_mask(label, image_size, stripe_width, gap_width, phase)
+    active_pixels = rng.random(image_size) < activation_probability
+    image = np.logical_and(stripe_mask, active_pixels).astype(np.float32)
+    noise = rng.normal(0.0, noise_sigma, size=image_size).astype(np.float32)
+    return np.clip(image + noise, 0.0, 1.0)
+
+
+class StripeDirectionDataset(Dataset):
+    def __init__(self, samples_per_class: int, seed: int) -> None:
+        rng = np.random.default_rng(seed)
+        images: List[np.ndarray] = []
+        labels: List[int] = []
+
+        for label in range(NUM_CLASSES):
+            for _ in range(samples_per_class):
+                images.append(generate_stripe_image(label=label, rng=rng))
+                labels.append(label)
+
+        permutation = rng.permutation(len(labels))
+        images_array = np.asarray(images, dtype=np.float32)[permutation]
+        labels_array = np.asarray(labels, dtype=np.int64)[permutation]
+        self.images = torch.from_numpy(images_array).unsqueeze(1)
+        self.labels = torch.from_numpy(labels_array)
+
+    def __len__(self) -> int:
+        return int(self.labels.numel())
+
+    def __getitem__(self, index: int):
+        return self.images[index], self.labels[index]
+
+
+def build_dataloaders(batch_size: int = BATCH_SIZE):
+    train_dataset = StripeDirectionDataset(TRAIN_SAMPLES_PER_CLASS, RANDOM_SEED)
+    test_dataset = StripeDirectionDataset(TEST_SAMPLES_PER_CLASS, RANDOM_SEED + 1)
+    train_generator = torch.Generator()
+    train_generator.manual_seed(RANDOM_SEED)
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "num_workers": 0,
+        "pin_memory": torch.cuda.is_available(),
+    }
+    train_loader = DataLoader(train_dataset, shuffle=True, generator=train_generator, **loader_kwargs)
+    test_loader = DataLoader(test_dataset, shuffle=False, **loader_kwargs)
+    return train_dataset, test_dataset, train_loader, test_loader
+
+
+class NonNegativeSymmetricConv1d(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = CONV_KERNEL_SIZE):
+        super().__init__()
+        if kernel_size != 3:
+            raise ValueError("Symmetric convolution currently supports only 1x3 kernels.")
+        kernel_shape = (out_channels, in_channels)
+        self.padding = kernel_size // 2
+        self.edge_kernel = nn.Parameter(torch.randn(kernel_shape))
+        self.center_kernel = nn.Parameter(torch.randn(kernel_shape))
+        self.bias = nn.Parameter(torch.zeros(out_channels))
+
+    def get_kernel(self) -> torch.Tensor:
+        edge = F.softplus(self.edge_kernel)
+        center = F.softplus(self.center_kernel)
+        return torch.stack([edge, center, edge], dim=-1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.conv1d(x, self.get_kernel(), bias=self.bias, padding=self.padding)
+
+
+class NonNegativeAsymmetricConv1d(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = CONV_KERNEL_SIZE):
+        super().__init__()
+        self.padding = kernel_size // 2
+        self.kernel = nn.Parameter(torch.randn(out_channels, in_channels, kernel_size))
+        self.bias = nn.Parameter(torch.zeros(out_channels))
+
+    def get_kernel(self) -> torch.Tensor:
+        return F.softplus(self.kernel)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.conv1d(x, self.get_kernel(), bias=self.bias, padding=self.padding)
+
+
+class StripeDirectionCNN(nn.Module):
+    def __init__(self, conv_mode: str) -> None:
+        super().__init__()
+        if conv_mode == "symmetric":
+            conv_cls = NonNegativeSymmetricConv1d
+        elif conv_mode == "asymmetric":
+            conv_cls = NonNegativeAsymmetricConv1d
+        else:
+            raise ValueError("conv_mode must be 'symmetric' or 'asymmetric'.")
+
+        self.conv_mode = conv_mode
+        self.conv1 = conv_cls(1, 8, kernel_size=CONV_KERNEL_SIZE)
+        self.conv2 = conv_cls(8, 1, kernel_size=CONV_KERNEL_SIZE)
+        self.act = nn.GELU()
+        self.classifier = nn.Linear(FLATTENED_IMAGE_LENGTH, NUM_CLASSES)
+
+    @staticmethod
+    def flatten_spatial_input(x: torch.Tensor) -> torch.Tensor:
+        return x.reshape(x.shape[0], x.shape[1], -1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.flatten_spatial_input(x)
+        x = self.act(self.conv1(x))
+        x = self.act(self.conv2(x))
+        x = torch.flatten(x, start_dim=1)
+        return self.classifier(x)
+
+    def kernel_examples(self, count: int = 3) -> List[List[float]]:
+        kernels = self.conv1.get_kernel().detach().cpu()
+        example_count = min(count, kernels.shape[0])
+        return [kernels[index, 0].tolist() for index in range(example_count)]
+
+
+def _ensure_spines_visible(ax, *, linewidth: float = 1.8) -> None:
+    for sp in ax.spines.values():
+        sp.set_visible(True)
+        sp.set_linewidth(linewidth)
+
+
+def _save_fig_robust(fig, save_path: str, *, dpi: int = PLOT_DPI, pad_inches: float = PLOT_PAD_INCHES) -> None:
+    base, ext = os.path.splitext(save_path)
+    ext = ext if ext else ".png"
+    tmp_path = base + ".tmp" + ext
+    os.makedirs(os.path.dirname(os.path.abspath(tmp_path)), exist_ok=True)
+    fig.savefig(
+        tmp_path,
+        dpi=int(dpi),
+        bbox_inches="tight",
+        pad_inches=float(pad_inches),
+        facecolor="white",
+    )
+    plt.close(fig)
+    try:
+        os.replace(tmp_path, save_path)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
+def build_confusion_cmap(base_color: str) -> LinearSegmentedColormap:
+    return LinearSegmentedColormap.from_list(f"cm_{base_color.strip('#')}", ["#ffffff", str(base_color)])
+
+
+def allocate_result_dir_under(root_dir: str, experiment_signature: str) -> str:
+    candidate = os.path.join(root_dir, experiment_signature)
+    if not os.path.exists(candidate):
+        return candidate
+    run_index = 2
+    while True:
+        candidate = os.path.join(root_dir, f"{experiment_signature}__run={run_index:02d}")
+        if not os.path.exists(candidate):
+            return candidate
+        run_index += 1
+
+
+def get_compare_run_dir(batch_size: int, lr_rate: float, epoch_num: int) -> str:
+    compare_root = os.path.join(RESULT_ROOT, "compare_both")
+    signature = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+    return allocate_result_dir_under(compare_root, signature)
+
+
+def build_training_artifact_paths(run_dir: str) -> Dict[str, str]:
+    return {
+        "csv_path": os.path.join(run_dir, "training_log.csv"),
+        "metrics_path": os.path.join(run_dir, "training_metrics.txt"),
+        "final_model_path": os.path.join(run_dir, "final_model.pth"),
+        "curve_path": os.path.join(run_dir, "loss_accuracy_curves.png"),
+        "train_confusion_matrix_path": os.path.join(run_dir, "confusion_matrix_training.png"),
+        "test_confusion_matrix_path": os.path.join(run_dir, "confusion_matrix_testing.png"),
+        "kernel_path": os.path.join(run_dir, "learned_kernel.txt"),
+        "kernel_figure_path": os.path.join(run_dir, "kernel_examples.png"),
+    }
+
+
+def copy_current_script_to_dir(target_dir: str) -> str:
+    source_path = os.path.abspath(__file__)
+    target_path = os.path.join(target_dir, os.path.basename(source_path))
+    shutil.copy2(source_path, target_path)
+    return target_path
+
+
+def save_run_config(run_dir: str, batch_size: int, lr_rate: float, epoch_num: int, conv_mode: str) -> None:
+    config = {
+        "task": "Left-45 and Right-45 patterns Recognition with flattened 1D convolution",
+        "dataset": {
+            "image_size": list(IMAGE_SIZE),
+            "num_classes": NUM_CLASSES,
+            "labels": LABEL_NAMES,
+            "train_samples_per_class": TRAIN_SAMPLES_PER_CLASS,
+            "test_samples_per_class": TEST_SAMPLES_PER_CLASS,
+            "stripe_width": STRIPE_WIDTH,
+            "gap_width": GAP_WIDTH,
+            "activation_probability": ACTIVATION_PROBABILITY,
+            "noise_sigma": NOISE_SIGMA,
+        },
+        "model": {
+            "conv_mode": conv_mode,
+            "kernel_constraint": "non-negative",
+            "symmetric_constraint": "[a,b,a]" if conv_mode == "symmetric" else "none",
+            "architecture": "Flatten(30x30->900)->Conv1(8,1x3)->GELU->Conv2(1,1x3)->GELU->Flatten(900)->Linear(2)",
+        },
+        "optimizer": {
+            "name": "Adam",
+            "initial_learning_rate": lr_rate,
+        },
+        "training": {
+            "batch_size": batch_size,
+            "epoch_num": epoch_num,
+            "device": str(DEVICE),
+        },
+        "note": "Both symmetric and asymmetric modes use non-negative 1x3 kernels on flattened 1D image sequences."
+    }
+    with open(os.path.join(run_dir, "run_config.json"), "w", encoding="utf-8") as file:
+        json.dump(config, file, indent=4, ensure_ascii=False)
+
+
+def initialize_training_artifacts(
+    artifacts: Dict[str, str],
+    batch_size: int,
+    lr_rate: float,
+    epoch_num: int,
+    conv_mode: str,
+) -> None:
+    with open(artifacts["metrics_path"], "w", encoding="utf-8") as file:
+        file.write("Training Metrics Summary\n")
+        file.write("task: Left-45 and Right-45 patterns Recognition with flattened 1D convolution\n")
+        file.write(f"device: {DEVICE}\n")
+        file.write(f"conv_mode: {conv_mode}\n")
+        file.write(f"batch_size: {batch_size}\n")
+        file.write(f"initial_learning_rate: {lr_rate}\n")
+        file.write(f"epoch_num: {epoch_num}\n")
+        file.write(f"image_size: {IMAGE_SIZE}\n")
+        file.write(f"num_classes: {NUM_CLASSES}\n")
+        file.write(f"train_samples_per_class: {TRAIN_SAMPLES_PER_CLASS}\n")
+        file.write(f"test_samples_per_class: {TEST_SAMPLES_PER_CLASS}\n")
+        file.write(f"noise_sigma: {NOISE_SIGMA}\n")
+        file.write("architecture: Flatten(30x30->900)->Conv1(8,1x3)->GELU->Conv2(1,1x3)->GELU->Flatten(900)->Linear(2)\n")
+
+    with open(artifacts["csv_path"], "w", newline="", encoding="utf-8") as file:
+        csv.writer(file).writerow(
+            [
+                "epoch",
+                "train_loss",
+                "train_accuracy",
+                "test_loss",
+                "test_accuracy",
+                "learning_rate",
+            ]
+        )
+
+
+def append_training_csv_row(
+    csv_path: str,
+    epoch: int,
+    train_loss: float,
+    train_accuracy: float,
+    test_loss: float,
+    test_accuracy: float,
+    current_lr: float,
+) -> None:
+    with open(csv_path, "a", newline="", encoding="utf-8") as file:
+        csv.writer(file).writerow(
+            [
+                epoch,
+                f"{train_loss:.6f}",
+                f"{train_accuracy:.6f}",
+                f"{test_loss:.6f}",
+                f"{test_accuracy:.6f}",
+                f"{current_lr:.8f}",
+            ]
+        )
+
+
+@torch.inference_mode()
+def evaluate_classification(model: nn.Module, data_loader: DataLoader, criterion: nn.Module) -> Tuple[float, float]:
+    model.eval()
+    total_loss = 0.0
+    total_correct = 0
+    total_samples = 0
+
+    for images, labels in data_loader:
+        images = images.to(DEVICE, non_blocking=True)
+        labels = labels.to(DEVICE, non_blocking=True)
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+        total_loss += loss.item() * labels.size(0)
+        total_correct += (torch.argmax(outputs, dim=1) == labels).sum().item()
+        total_samples += labels.size(0)
+
+    average_loss = total_loss / max(total_samples, 1)
+    accuracy = 100.0 * total_correct / max(total_samples, 1)
+    model.train()
+    return average_loss, accuracy
+
+
+@torch.inference_mode()
+def compute_confusion_matrix_from_loader(model: nn.Module, dataloader: DataLoader) -> np.ndarray:
+    cm = torch.zeros((NUM_CLASSES, NUM_CLASSES), dtype=torch.long, device=DEVICE)
+    model.eval()
+    for images, labels in dataloader:
+        images = images.to(DEVICE, non_blocking=True)
+        labels = labels.to(DEVICE, non_blocking=True)
+        outputs = model(images)
+        predictions = torch.argmax(outputs, dim=1)
+        valid = (labels >= 0) & (labels < NUM_CLASSES)
+        true_labels = labels[valid]
+        pred_labels = predictions[valid]
+        idx = true_labels * NUM_CLASSES + pred_labels
+        cm += torch.bincount(idx, minlength=NUM_CLASSES * NUM_CLASSES).view(NUM_CLASSES, NUM_CLASSES)
+    return cm.detach().cpu().numpy()
+
+
+def plot_confusion_matrix(
+    cm: np.ndarray,
+    save_path: str,
+    title: str,
+    tick_labels: List[str] | None = None,
+    dpi: int = PLOT_DPI,
+    cmap=None,
+) -> None:
+    num_classes = cm.shape[0]
+    if tick_labels is not None and len(tick_labels) == num_classes:
+        labels = tick_labels
+    else:
+        labels = [str(i) for i in range(num_classes)]
+
+    cm_sum = float(np.sum(cm))
+    acc_pct = (100.0 * float(np.trace(cm)) / cm_sum) if cm_sum > 0 else 0.0
+    fig, ax = plt.subplots(figsize=(10, 10), dpi=int(dpi))
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("white")
+    ax.imshow(cm, cmap=("Blues" if cmap is None else cmap), interpolation="nearest")
+
+    base_title = title if title else "Validation Confusion Matrix"
+    full_title = f"{base_title} | Acc: {acc_pct:.2f}%"
+    ax.set_title(full_title, fontsize=max(int(PLOT_FONTSIZE), 24), fontfamily=PLOT_FONT_FAMILY)
+    ax.set_xlabel("Predicted", fontsize=max(int(PLOT_FONTSIZE), 24), fontfamily=PLOT_FONT_FAMILY)
+    ax.set_ylabel("True", fontsize=max(int(PLOT_FONTSIZE), 24), fontfamily=PLOT_FONT_FAMILY)
+    ax.set_xticks(np.arange(num_classes))
+    ax.set_yticks(np.arange(num_classes))
+    ax.set_xticklabels(labels, fontsize=max(int(PLOT_FONTSIZE), 24), fontfamily=PLOT_FONT_FAMILY)
+    ax.set_yticklabels(labels, fontsize=max(int(PLOT_FONTSIZE), 24), fontfamily=PLOT_FONT_FAMILY)
+    _ensure_spines_visible(ax, linewidth=1.8)
+
+    for i in range(num_classes):
+        for j in range(num_classes):
+            val = int(cm[i, j])
+            color = "white" if val > (cm.max() * 0.5 if cm.max() > 0 else 0) else "black"
+            ax.text(
+                j,
+                i,
+                str(val),
+                ha="center",
+                va="center",
+                color=color,
+                fontsize=14,
+                fontfamily=PLOT_FONT_FAMILY,
+            )
+
+    _save_fig_robust(fig, save_path, dpi=int(dpi), pad_inches=PLOT_PAD_INCHES)
+
+
+def save_loss_accuracy_curves(
+    train_losses: List[float],
+    test_losses: List[float],
+    train_accuracies: List[float],
+    test_accuracies: List[float],
+    *,
+    epochs: int,
+    title: str,
+    save_path: str,
+    dpi: int = PLOT_DPI,
+) -> None:
+    fig, ax1 = plt.subplots(figsize=(12, 8), dpi=dpi)
+    x = np.arange(1, len(train_losses) + 1)
+
+    loss_color = "#DC0000"
+    acc_color = "#1f4db8"
+
+    l1, = ax1.plot(x, train_losses, color=loss_color, linewidth=2.2, label="Train Loss")
+    l2, = ax1.plot(x, test_losses, color=loss_color, linewidth=2.2, linestyle="--", alpha=0.65, label="Test Loss")
+    _ensure_spines_visible(ax1, linewidth=1.8)
+    ax1.set_xlim(0, epochs)
+    if epochs >= 300:
+        major_step = 50
+    elif epochs >= 150:
+        major_step = 25
+    elif epochs >= 100:
+        major_step = 20
+    else:
+        major_step = 10
+    ax1.set_xticks(np.arange(0, epochs + 1, major_step))
+    ax1.tick_params(axis="x", which="major", labelsize=max(int(PLOT_FONTSIZE), 24), length=8, width=1.6, direction="out")
+    ax1.tick_params(axis="y", which="major", labelsize=max(int(PLOT_FONTSIZE), 24), length=8, width=1.6, direction="out", colors=loss_color)
+    ax1.minorticks_on()
+    ax1.tick_params(axis="x", which="minor", length=4, width=1.2, direction="out")
+    ax1.tick_params(axis="y", which="minor", length=4, width=1.2, direction="out", colors=loss_color)
+    ax1.spines["left"].set_color(loss_color)
+    ax1.spines["left"].set_linewidth(1.6)
+    ax1.set_xlabel("Epochs", fontsize=max(int(PLOT_FONTSIZE), 24), fontfamily=PLOT_FONT_FAMILY)
+    ax1.set_ylabel("Loss", color=loss_color, fontsize=max(int(PLOT_FONTSIZE), 24), fontfamily=PLOT_FONT_FAMILY)
+    ax1.grid(False)
+
+    ax2 = ax1.twinx()
+    a1, = ax2.plot(x, train_accuracies, color=acc_color, linewidth=2.2, label="Train Acc")
+    a2, = ax2.plot(x, test_accuracies, color=acc_color, linewidth=2.2, linestyle="--", alpha=0.65, label="Test Acc")
+    _ensure_spines_visible(ax2, linewidth=1.8)
+    ax2.tick_params(axis="y", which="major", labelsize=max(int(PLOT_FONTSIZE), 24), length=8, width=1.6, direction="out", colors=acc_color)
+    ax2.tick_params(axis="y", which="minor", length=4, width=1.2, direction="out", colors=acc_color)
+    ax2.spines["right"].set_color(acc_color)
+    ax2.spines["right"].set_linewidth(1.6)
+    ax2.set_ylabel("Accuracy (%)", color=acc_color, fontsize=max(int(PLOT_FONTSIZE), 24), fontfamily=PLOT_FONT_FAMILY)
+
+    handles = [l1, l2, a1, a2]
+    ax1.legend(
+        handles,
+        [item.get_label() for item in handles],
+        loc="center right",
+        ncol=1,
+        frameon=False,
+        fontsize=max(int(PLOT_FONTSIZE), 24),
+        bbox_to_anchor=(0.99, 0.55),
+        borderaxespad=0.2,
+    )
+    ax1.set_title(title, fontsize=max(int(PLOT_FONTSIZE), 24), fontfamily=PLOT_FONT_FAMILY)
+    _save_fig_robust(fig, save_path, dpi=dpi, pad_inches=PLOT_PAD_INCHES)
+
+
+def save_dataset_preview(dataset: StripeDirectionDataset, save_path: str, samples_per_class: int = 6) -> None:
+    fig, axes = plt.subplots(NUM_CLASSES, samples_per_class, figsize=(2.0 * samples_per_class, 3.4 * NUM_CLASSES), dpi=PLOT_DPI)
+    axes = np.asarray(axes, dtype=object).reshape(NUM_CLASSES, samples_per_class)
+
+    for label in range(NUM_CLASSES):
+        indices = (dataset.labels == label).nonzero(as_tuple=False).flatten()[:samples_per_class].tolist()
+        for col, index in enumerate(indices):
+            axes[label, col].imshow(dataset.images[index, 0].numpy(), cmap="gray", vmin=0.0, vmax=1.0)
+            axes[label, col].set_title(LABEL_NAMES[label], fontsize=10)
+            axes[label, col].axis("off")
+
+    fig.suptitle("Stripe dataset examples for 1D flattened convolution: right-45 & left-45", fontsize=16)
+    _save_fig_robust(fig, save_path, dpi=PLOT_DPI, pad_inches=PLOT_PAD_INCHES)
+
+
+def save_single_stripe_png(image: np.ndarray, save_path: str) -> None:
+    fig, ax = plt.subplots(figsize=(4, 4), dpi=PLOT_DPI)
+    ax.imshow(image, cmap="gray", vmin=0.0, vmax=1.0)
+    ax.axis("off")
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("white")
+    _save_fig_robust(fig, save_path, dpi=PLOT_DPI, pad_inches=0.02)
+
+
+def export_dataset_png_examples(samples_per_label: int = 1) -> str:
+    train_dataset, test_dataset, _, _ = build_dataloaders(batch_size=BATCH_SIZE)
+    export_dir = os.path.join(RESULT_ROOT, PNG_EXPORT_DIRNAME)
+    os.makedirs(export_dir, exist_ok=True)
+    copy_current_script_to_dir(export_dir)
+
+    dataset_map = {
+        "train": train_dataset,
+        "test": test_dataset,
+    }
+    label_slug_map = {
+        0: "right45",
+        1: "left45",
+    }
+
+    for dataset_name, dataset in dataset_map.items():
+        for label, label_slug in label_slug_map.items():
+            indices = (dataset.labels == label).nonzero(as_tuple=False).flatten()[:samples_per_label].tolist()
+            for sample_index, dataset_index in enumerate(indices, start=1):
+                save_path = os.path.join(export_dir, f"{dataset_name}_{label_slug}_{sample_index:02d}.png")
+                save_single_stripe_png(dataset.images[dataset_index, 0].numpy(), save_path)
+
+    return export_dir
+
+
+@torch.inference_mode()
+def collect_kernel_response_examples(
+    model: StripeDirectionCNN,
+    reference_image: torch.Tensor,
+    kernel_count: int = 3,
+) -> Tuple[np.ndarray, List[np.ndarray], List[np.ndarray]]:
+    kernels = model.conv1.get_kernel().detach().cpu()
+    reference_batch = reference_image.unsqueeze(0).to(DEVICE)
+    flattened_batch = model.flatten_spatial_input(reference_batch)
+    responses = model.conv1(flattened_batch).detach().cpu()[0]
+    example_count = min(kernel_count, kernels.shape[0])
+    kernel_list = [kernels[index, 0].numpy() for index in range(example_count)]
+    response_list = [responses[index].numpy() for index in range(example_count)]
+    return flattened_batch[0, 0].detach().cpu().numpy(), kernel_list, response_list
+
+
+def save_kernel_examples_figure(
+    model: StripeDirectionCNN,
+    reference_image: torch.Tensor,
+    save_path: str,
+    kernel_count: int = 3,
+) -> None:
+    input_signal, kernels, responses = collect_kernel_response_examples(model, reference_image, kernel_count)
+    example_count = len(kernels)
+    fig, axes = plt.subplots(3, example_count, figsize=(3.6 * example_count, 8.5), dpi=PLOT_DPI)
+    axes = np.asarray(axes, dtype=object).reshape(3, example_count)
+
+    for col in range(example_count):
+        axes[0, col].plot(input_signal, color="black", linewidth=1.2)
+        axes[0, col].set_title(f"Flattened input {col + 1}", fontsize=12)
+        axes[0, col].set_xlim(0, len(input_signal) - 1)
+        axes[0, col].set_ylim(-0.05, 1.05)
+
+        axes[1, col].plot(kernels[col], color="#1f4db8", linewidth=2.0, marker="o")
+        axes[1, col].set_title(f"1D kernel {col + 1}", fontsize=12)
+        axes[1, col].set_xlim(0, len(kernels[col]) - 1)
+
+        axes[2, col].plot(responses[col], color="#DC0000", linewidth=1.2)
+        axes[2, col].set_title(f"1D response {col + 1}", fontsize=12)
+        axes[2, col].set_xlim(0, len(responses[col]) - 1)
+
+    fig.suptitle(f"{model.conv_mode.title()} conv1 flattened 1D examples: {example_count} kernels", fontsize=16)
+    _save_fig_robust(fig, save_path, dpi=PLOT_DPI, pad_inches=PLOT_PAD_INCHES)
+
+
+def save_confusion_artifacts(
+    artifacts: Dict[str, str],
+    model: nn.Module,
+    train_loader: DataLoader,
+    test_loader: DataLoader,
+    conv_mode: str,
+) -> None:
+    cmap = build_confusion_cmap("#DC0000" if conv_mode == "symmetric" else "#1f4db8")
+    train_cm = compute_confusion_matrix_from_loader(model, train_loader)
+    test_cm = compute_confusion_matrix_from_loader(model, test_loader)
+    plot_confusion_matrix(train_cm, artifacts["train_confusion_matrix_path"], f"{conv_mode.title()} Training", tick_labels=LABEL_NAMES, dpi=PLOT_DPI, cmap=cmap)
+    plot_confusion_matrix(test_cm, artifacts["test_confusion_matrix_path"], f"{conv_mode.title()} Testing", tick_labels=LABEL_NAMES, dpi=PLOT_DPI, cmap=cmap)
+
+
+def save_runtime_artifacts(
+    artifacts: Dict[str, str],
+    history: Dict[str, List[float]],
+    model: StripeDirectionCNN,
+    train_loader: DataLoader,
+    test_loader: DataLoader,
+    reference_image: torch.Tensor,
+) -> None:
+    save_loss_accuracy_curves(
+        history["train_losses"],
+        history["test_losses"],
+        history["train_accuracies"],
+        history["test_accuracies"],
+        epochs=len(history["train_losses"]),
+        title=f"{model.conv_mode.title()} | Loss & Accuracy Curves",
+        save_path=artifacts["curve_path"],
+        dpi=PLOT_DPI,
+    )
+    save_confusion_artifacts(artifacts, model, train_loader, test_loader, model.conv_mode)
+    save_kernel_examples_figure(model, reference_image, artifacts["kernel_figure_path"], kernel_count=3)
+
+
+def train(
+    model: StripeDirectionCNN,
+    train_loader: DataLoader,
+    test_loader: DataLoader,
+    optimizer: optim.Optimizer,
+    run_dir: str,
+    batch_size: int,
+    lr_rate: float,
+    epoch_num: int,
+    reference_image: torch.Tensor,
+) -> Tuple[Dict[str, List[float]], Dict[str, str]]:
+    artifacts = build_training_artifact_paths(run_dir)
+    initialize_training_artifacts(artifacts, batch_size, lr_rate, epoch_num, model.conv_mode)
+    criterion = nn.CrossEntropyLoss()
+    history = {
+        "train_losses": [],
+        "train_accuracies": [],
+        "test_losses": [],
+        "test_accuracies": [],
+    }
+
+    progress_bar = tqdm(
+        range(epoch_num),
+        desc=f"{model.conv_mode.title()} training",
+        colour=PROGRESS_COLORS[model.conv_mode],
+    )
+    for epoch in progress_bar:
+        model.train()
+        running_loss = 0.0
+        total_samples = 0
+        total_correct = 0
+
+        for images, labels in train_loader:
+            images = images.to(DEVICE, non_blocking=True)
+            labels = labels.to(DEVICE, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item() * labels.size(0)
+            total_samples += labels.size(0)
+            total_correct += (torch.argmax(outputs, dim=1) == labels).sum().item()
+
+        train_loss = running_loss / max(total_samples, 1)
+        train_accuracy = 100.0 * total_correct / max(total_samples, 1)
+        test_loss, test_accuracy = evaluate_classification(model, test_loader, criterion)
+
+        history["train_losses"].append(train_loss)
+        history["train_accuracies"].append(train_accuracy)
+        history["test_losses"].append(test_loss)
+        history["test_accuracies"].append(test_accuracy)
+
+        append_training_csv_row(
+            artifacts["csv_path"],
+            epoch + 1,
+            train_loss,
+            train_accuracy,
+            test_loss,
+            test_accuracy,
+            optimizer.param_groups[0]["lr"],
+        )
+
+        progress_bar.set_postfix(
+            train_loss=f"{train_loss:.4f}",
+            train_acc=f"{train_accuracy:.2f}%",
+            test_acc=f"{test_accuracy:.2f}%",
+        )
+
+    save_runtime_artifacts(artifacts, history, model, train_loader, test_loader, reference_image)
+    torch.save(model.state_dict(), artifacts["final_model_path"])
+    return history, artifacts
+
+
+def write_model_summary(
+    artifacts: Dict[str, str],
+    model: StripeDirectionCNN,
+    history: Dict[str, List[float]],
+) -> None:
+    kernel_examples = model.kernel_examples(count=3)
+    with open(artifacts["kernel_path"], "w", encoding="utf-8") as file:
+        json.dump(kernel_examples, file, indent=4)
+
+    with open(artifacts["metrics_path"], "a", encoding="utf-8") as file:
+        file.write(f"final_train_loss: {history['train_losses'][-1]:.6f}\n")
+        file.write(f"final_train_accuracy: {history['train_accuracies'][-1]:.6f}\n")
+        file.write(f"final_test_loss: {history['test_losses'][-1]:.6f}\n")
+        file.write(f"final_test_accuracy: {history['test_accuracies'][-1]:.6f}\n")
+
+
+def run_single_experiment(
+    batch_size: int,
+    lr_rate: float,
+    epoch_num: int,
+    train_loader: DataLoader,
+    test_loader: DataLoader,
+    conv_mode: str,
+    run_dir: str,
+    reference_image: torch.Tensor,
+) -> Dict[str, object]:
+    os.makedirs(run_dir, exist_ok=True)
+    save_run_config(run_dir, batch_size, lr_rate, epoch_num, conv_mode)
+    model = StripeDirectionCNN(conv_mode=conv_mode).to(DEVICE)
+    optimizer = optim.Adam(model.parameters(), lr=lr_rate)
+    history, artifacts = train(
+        model,
+        train_loader,
+        test_loader,
+        optimizer,
+        run_dir,
+        batch_size,
+        lr_rate,
+        epoch_num,
+        reference_image,
+    )
+    write_model_summary(artifacts, model, history)
+    return {
+        "history": history,
+        "run_dir": run_dir,
+        "final_test_accuracy": history["test_accuracies"][-1],
+    }
+
+
+def plot_compare_curves(
+    symmetric_history: Dict[str, List[float]],
+    asymmetric_history: Dict[str, List[float]],
+    save_path: str,
+) -> None:
+    epochs_sym = np.arange(1, len(symmetric_history["train_losses"]) + 1)
+    epochs_asym = np.arange(1, len(asymmetric_history["train_losses"]) + 1)
+
+    fig, ax1 = plt.subplots(figsize=(12, 8), dpi=PLOT_DPI)
+    loss_color = "#DC0000"
+    acc_color = "#1f4db8"
+
+    l1, = ax1.plot(epochs_sym, symmetric_history["train_losses"], color=loss_color, linewidth=2.2, linestyle="-", label="Symmetric Loss")
+    l2, = ax1.plot(epochs_asym, asymmetric_history["train_losses"], color=loss_color, linewidth=2.2, linestyle="--", alpha=0.65, label="Asymmetric Loss")
+    _ensure_spines_visible(ax1, linewidth=1.8)
+    ax1.set_xlabel("Epochs", fontsize=max(int(PLOT_FONTSIZE), 24), fontfamily=PLOT_FONT_FAMILY)
+    ax1.set_ylabel("Loss", color=loss_color, fontsize=max(int(PLOT_FONTSIZE), 24), fontfamily=PLOT_FONT_FAMILY)
+    ax1.tick_params(axis="x", which="major", labelsize=max(int(PLOT_FONTSIZE), 24), length=8, width=1.6, direction="out")
+    ax1.tick_params(axis="y", which="major", labelsize=max(int(PLOT_FONTSIZE), 24), length=8, width=1.6, direction="out", colors=loss_color)
+    ax1.minorticks_on()
+    ax1.tick_params(axis="x", which="minor", length=4, width=1.2, direction="out")
+    ax1.tick_params(axis="y", which="minor", length=4, width=1.2, direction="out", colors=loss_color)
+    ax1.spines["left"].set_color(loss_color)
+    ax1.spines["left"].set_linewidth(1.6)
+    ax1.grid(False)
+
+    ax2 = ax1.twinx()
+    a1, = ax2.plot(epochs_sym, symmetric_history["train_accuracies"], color=acc_color, linewidth=2.2, linestyle="-", label="Symmetric Accuracy")
+    a2, = ax2.plot(epochs_asym, asymmetric_history["train_accuracies"], color=acc_color, linewidth=2.2, linestyle="--", alpha=0.65, label="Asymmetric Accuracy")
+    _ensure_spines_visible(ax2, linewidth=1.8)
+    ax2.tick_params(axis="y", which="major", labelsize=max(int(PLOT_FONTSIZE), 24), length=8, width=1.6, direction="out", colors=acc_color)
+    ax2.tick_params(axis="y", which="minor", length=4, width=1.2, direction="out", colors=acc_color)
+    ax2.spines["right"].set_color(acc_color)
+    ax2.spines["right"].set_linewidth(1.6)
+    ax2.set_ylabel("Accuracy (%)", color=acc_color, fontsize=max(int(PLOT_FONTSIZE), 24), fontfamily=PLOT_FONT_FAMILY)
+
+    handles = [l1, l2, a1, a2]
+    ax1.legend(
+        handles,
+        [item.get_label() for item in handles],
+        loc="center right",
+        ncol=1,
+        frameon=False,
+        fontsize=max(int(PLOT_FONTSIZE), 24),
+        bbox_to_anchor=(0.99, 0.55),
+        borderaxespad=0.2,
+    )
+    ax1.set_title("Symmetric vs Asymmetric | 1D Flattened CNN Train Loss & Accuracy", fontsize=max(int(PLOT_FONTSIZE), 24), fontfamily=PLOT_FONT_FAMILY)
+    _save_fig_robust(fig, save_path, dpi=PLOT_DPI, pad_inches=PLOT_PAD_INCHES)
+
+
+def compare_symmetric_asymmetric(batch_size: int, lr_rate: float, epoch_num: int) -> str:
+    compare_dir = get_compare_run_dir(batch_size, lr_rate, epoch_num)
+    os.makedirs(compare_dir, exist_ok=True)
+    script_copy_path = copy_current_script_to_dir(compare_dir)
+
+    train_dataset, _, train_loader, test_loader = build_dataloaders(batch_size)
+    save_dataset_preview(train_dataset, os.path.join(compare_dir, DATASET_PREVIEW_FILENAME))
+    reference_image = train_dataset.images[0]
+
+    symmetric_result = run_single_experiment(
+        batch_size=batch_size,
+        lr_rate=lr_rate,
+        epoch_num=epoch_num,
+        train_loader=train_loader,
+        test_loader=test_loader,
+        conv_mode="symmetric",
+        run_dir=os.path.join(compare_dir, "symmetric"),
+        reference_image=reference_image,
+    )
+    asymmetric_result = run_single_experiment(
+        batch_size=batch_size,
+        lr_rate=lr_rate,
+        epoch_num=epoch_num,
+        train_loader=train_loader,
+        test_loader=test_loader,
+        conv_mode="asymmetric",
+        run_dir=os.path.join(compare_dir, "asymmetric"),
+        reference_image=reference_image,
+    )
+
+    plot_compare_curves(
+        symmetric_result["history"],
+        asymmetric_result["history"],
+        os.path.join(compare_dir, COMPARE_CURVE_FILENAME),
+    )
+
+    comparison_summary = {
+        "symmetric_final_test_accuracy": symmetric_result["final_test_accuracy"],
+        "asymmetric_final_test_accuracy": asymmetric_result["final_test_accuracy"],
+        "saved_files": {
+            "python_script": os.path.basename(script_copy_path),
+            "dataset_preview": DATASET_PREVIEW_FILENAME,
+            "compare_curve": COMPARE_CURVE_FILENAME,
+            "symmetric_csv": os.path.join("symmetric", "training_log.csv"),
+            "asymmetric_csv": os.path.join("asymmetric", "training_log.csv"),
+            "symmetric_curve": os.path.join("symmetric", "loss_accuracy_curves.png"),
+            "asymmetric_curve": os.path.join("asymmetric", "loss_accuracy_curves.png"),
+            "symmetric_train_confusion": os.path.join("symmetric", "confusion_matrix_training.png"),
+            "symmetric_test_confusion": os.path.join("symmetric", "confusion_matrix_testing.png"),
+            "asymmetric_train_confusion": os.path.join("asymmetric", "confusion_matrix_training.png"),
+            "asymmetric_test_confusion": os.path.join("asymmetric", "confusion_matrix_testing.png"),
+            "symmetric_kernel_examples": os.path.join("symmetric", "kernel_examples.png"),
+            "asymmetric_kernel_examples": os.path.join("asymmetric", "kernel_examples.png"),
+        },
+        "note": "This flattened-1D stripe-direction task compares mirror-symmetric and asymmetric 1x3 convolution kernels on right-45 versus left-45 recognition.",
+    }
+    with open(os.path.join(compare_dir, COMPARE_SUMMARY_FILENAME), "w", encoding="utf-8") as file:
+        json.dump(comparison_summary, file, indent=4)
+
+    return compare_dir
+
+
+def main() -> None:
+    configure_reproducibility(RANDOM_SEED)
+    command = [1]
+
+    if 1 in command:
+        compare_dir = compare_symmetric_asymmetric(
+            batch_size=BATCH_SIZE,
+            lr_rate=LEARNING_RATE,
+            epoch_num=EPOCHS,
+        )
+        print(f"Results saved to: {os.path.abspath(compare_dir)}")
+        return
+
+    if 2 in command:
+        export_dir = export_dataset_png_examples(samples_per_label=1)
+        print(f"PNG files saved to: {os.path.abspath(export_dir)}")
+        return
+
+    raise ValueError("Unsupported command. Use command=[1] for training/compare or command=[2] for PNG export.")
+
+
+if __name__ == "__main__":
+    main()
