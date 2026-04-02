@@ -1,6 +1,5 @@
 # Left-45-and-Right-45-patterns-Recognition-with-1D-convolution
-Left-45 and Right-45 patterns Recognition with 1D convolution
-This code is used for calculating the results in Figures S3e–S3f,  which compares the performance of the task on recognizing Left-45 and Right-45 patterns, with numerically symmetric and asymmetric convolution kernels.
+This Python code is used for calculating the results in Figures S3e–S3f,  which compares the performance of the task on recognizing Left-45 and Right-45 patterns, with numerically symmetric and asymmetric convolution kernels.
 
 task: Left-45 and Right-45 patterns Recognition with 1D convolution
 device: cuda
